@@ -1,5 +1,12 @@
 use std::sync::Arc;
 
+
+
+
+use std::collections::{VecDeque, HashMap};
+use std::fmt;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use derive_more::Constructor;
 use execution_engine::ExecutionEngine;
@@ -14,6 +21,8 @@ use helper_functions::{
 use ssz::SszHash;
 use state_cache::StateWithRewards;
 use std_ext::ArcExt as _;
+use tracing::{info, warn}; 
+use tracing::trace;
 use transition_functions::{
     combined,
     unphased::{ProcessSlots, StateRootPolicy},
@@ -27,20 +36,124 @@ use types::{
     traits::{BeaconBlock as _, BeaconState as _, SignedBeaconBlock as _},
 };
 
+
+pub struct TimingMetrics {
+    pub times: VecDeque<Duration>,
+    pub total: Duration,
+    pub max_size: usize,
+}
+
+impl Default for TimingMetrics {
+    fn default() -> Self {
+        Self::new(100) // Default max_size of 100
+    }
+}
+
+impl TimingMetrics {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            times: VecDeque::with_capacity(max_size),
+            total: Duration::default(),
+            max_size,
+        }
+    }
+
+    pub fn update(&mut self, duration: Duration) {
+        if self.times.len() >= self.max_size {
+            if let Some(old) = self.times.pop_front() {
+                self.total -= old;
+            }
+        }
+        self.times.push_back(duration);
+        self.total += duration;
+    }
+
+    pub fn min(&self) -> Option<Duration> {
+        self.times.iter().min().copied()
+    }
+
+    pub fn max(&self) -> Option<Duration> {
+        self.times.iter().max().copied()
+    }
+
+    pub fn average(&self) -> Option<Duration> {
+        (!self.times.is_empty()).then(|| self.total / self.times.len() as u32)
+    }
+
+    pub fn median(&self) -> Option<Duration> {
+        let len = self.times.len();
+        if len == 0 {
+            return None;
+        }
+        let mut sorted: Vec<_> = self.times.iter().collect();
+        sorted.sort();
+        let mid_idx = len / 2;
+        Some((*sorted[mid_idx] + *sorted[len - 1 - mid_idx]) / 2)
+    }
+
+    pub fn count(&self) -> usize {
+        self.times.len()
+    }
+
+    pub fn last(&self) -> Option<Duration> {
+        self.times.back().copied()
+    }
+
+    pub fn total(&self) -> Duration {
+        self.total
+    }
+
+    pub fn times(&self) -> &VecDeque<Duration> {
+        &self.times
+    }
+
+    fn to_milliseconds(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+}
+
+impl fmt::Display for TimingMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.times.is_empty() {
+            write!(f, "Timing metrics are empty.")
+        } else {
+            let min_ms = self.min().map(Self::to_milliseconds).unwrap_or(0.0);
+            let max_ms = self.max().map(Self::to_milliseconds).unwrap_or(0.0);
+            let avg_ms = self.average().map(Self::to_milliseconds).unwrap_or(0.0);
+            let median_ms = self.median().map(Self::to_milliseconds).unwrap_or(0.0);
+            
+            write!(
+                f,
+                "Min: {:.1}ms, Max: {:.1}ms, Avg: {:.1}ms, Median: {:.1}ms",
+                min_ms, max_ms, avg_ms, median_ms
+            )
+        }
+    }
+}
+
 #[derive(Constructor)]
 pub struct BlockProcessor<P: Preset> {
     chain_config: Arc<ChainConfig>,
     state_cache: Arc<StateCacheProcessor<P>>,
+    metrics: Mutex<HashMap<String, TimingMetrics>>,
 }
 
 impl<P: Preset> BlockProcessor<P> {
+    fn update_metrics(&self, name: &str, duration: Duration) {
+        let mut metrics = self.metrics.lock().unwrap();
+        let entry = metrics.entry(name.to_string()).or_insert_with(|| TimingMetrics::new(100));
+        entry.update(duration);
+        trace!("{} timing: {}", name, entry);
+    }
     pub fn process_untrusted_block_with_report(
         &self,
         mut state: Arc<BeaconState<P>>,
         block: &BeaconBlock<P>,
         skip_randao_verification: bool,
     ) -> Result<StateWithRewards<P>> {
-        self.state_cache
+        let start = Instant::now();
+        info!("Processing untrusted block with slot: {}", block.slot());
+        let result = self.state_cache
             .get_or_insert_with(block.hash_tree_root(), block.slot(), false, || {
                 let mut slot_report = RealSlotReport::default();
 
@@ -53,9 +166,14 @@ impl<P: Preset> BlockProcessor<P> {
                 )?;
 
                 let block_rewards = calculate_block_rewards(&slot_report);
+                info!("Block processed. Slot: {} | Rewards: {:?}", block.slot(), block_rewards);
+
 
                 Ok((state, Some(block_rewards)))
-            })
+            });
+        self.update_metrics("process_untrusted_block", start.elapsed());
+        result
+    
     }
 
     pub fn process_trusted_block_with_report(
@@ -63,7 +181,9 @@ impl<P: Preset> BlockProcessor<P> {
         mut state: Arc<BeaconState<P>>,
         block: &BeaconBlock<P>,
     ) -> Result<StateWithRewards<P>> {
-        self.state_cache
+        let start = Instant::now();
+        info!("Processing trusted block with slot: {}", block.slot());
+        let result = self.state_cache
             .get_or_insert_with(block.hash_tree_root(), block.slot(), false, || {
                 let mut slot_report = RealSlotReport::default();
 
@@ -75,9 +195,13 @@ impl<P: Preset> BlockProcessor<P> {
                 )?;
 
                 let block_rewards = calculate_block_rewards(&slot_report);
+                info!("Trusted block processed. Slot: {} | Rewards: {:?}", block.slot(), block_rewards);
 
                 Ok((state, Some(block_rewards)))
-            })
+            });
+        self.update_metrics("process_trusted_block", start.elapsed());
+        result
+
     }
 
     pub fn process_untrusted_blinded_block_with_report(
@@ -86,7 +210,9 @@ impl<P: Preset> BlockProcessor<P> {
         block: &BlindedBeaconBlock<P>,
         skip_randao_verification: bool,
     ) -> Result<StateWithRewards<P>> {
-        self.state_cache
+        let start = Instant::now();
+        info!("Processing untrusted blinded block with slot: {}", block.slot());
+        let result = self.state_cache
             .get_or_insert_with(block.hash_tree_root(), block.slot(), false, || {
                 let mut slot_report = RealSlotReport::default();
 
@@ -99,9 +225,13 @@ impl<P: Preset> BlockProcessor<P> {
                 )?;
 
                 let block_rewards = calculate_block_rewards(&slot_report);
+                info!("Untrusted blinded block processed. Slot: {} | Rewards: {:?}", block.slot(), block_rewards);
+
 
                 Ok((state, Some(block_rewards)))
-            })
+            });
+        self.update_metrics("process_untrusted_blinded_block", start.elapsed());
+        result
     }
 
     pub fn process_trusted_blinded_block_with_report(
@@ -109,7 +239,9 @@ impl<P: Preset> BlockProcessor<P> {
         mut state: Arc<BeaconState<P>>,
         block: &BlindedBeaconBlock<P>,
     ) -> Result<StateWithRewards<P>> {
-        self.state_cache
+        let start = Instant::now();
+        info!("Processing trusted blinded block with slot: {}", block.slot());
+        let result = self.state_cache
             .get_or_insert_with(block.hash_tree_root(), block.slot(), false, || {
                 let mut slot_report = RealSlotReport::default();
 
@@ -121,9 +253,13 @@ impl<P: Preset> BlockProcessor<P> {
                 )?;
 
                 let block_rewards = calculate_block_rewards(&slot_report);
+                info!("Trusted blinded block processed. Slot: {} | Rewards: {:?}", block.slot(), block_rewards);
+
 
                 Ok((state, Some(block_rewards)))
-            })
+            });
+        self.update_metrics("process_trusted_blinded_block", start.elapsed());
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -138,7 +274,9 @@ impl<P: Preset> BlockProcessor<P> {
         verifier: impl Verifier + Send,
         slot_report: impl SlotReport + Send,
     ) -> Result<Arc<BeaconState<P>>> {
-        self.state_cache
+        let start = Instant::now();
+        info!("Performing state transition for block with root: {:?}, slot: {}", block_root, block.message().slot());
+        let result = self.state_cache
             .get_or_insert_with(block_root, block.message().slot(), true, || {
                 combined::custom_state_transition(
                     &self.chain_config,
@@ -153,15 +291,22 @@ impl<P: Preset> BlockProcessor<P> {
 
                 Ok((state, None))
             })
-            .map(|(state, _)| state)
-    }
+            .map(|(state, _)| {
+                info!("State transition completed for block with slot: {}", block.message().slot());
+                state
+            });
+            self.update_metrics("perform_state_transition", start.elapsed());
+            result
+        }
 
     pub fn validate_block_for_gossip(
         &self,
         store: &Store<P>,
         block: &Arc<SignedBeaconBlock<P>>,
     ) -> Result<Option<BlockAction<P>>> {
-        store.validate_block_for_gossip(block, |parent| {
+        let start = Instant::now();
+        info!("Validating block for gossip with slot: {}", block.message().slot());
+        let result = store.validate_block_for_gossip(block, |parent| {
             let block_slot = block.message().slot();
 
             // > Make a copy of the state to avoid mutability issues
@@ -176,9 +321,12 @@ impl<P: Preset> BlockProcessor<P> {
             }
 
             combined::process_block_for_gossip(&self.chain_config, &state, block)?;
+            info!("Block validation for gossip complete for slot: {}", block.message().slot());
 
             Ok(None)
-        })
+        });
+        self.update_metrics("validate_block_for_gossip", start.elapsed());
+        result
     }
 
     pub fn validate_block<E: ExecutionEngine<P> + Send>(
@@ -189,7 +337,9 @@ impl<P: Preset> BlockProcessor<P> {
         execution_engine: E,
         verifier: impl Verifier + Send,
     ) -> Result<BlockAction<P>> {
-        store.validate_block_with_custom_state_transition(block, |block_root, parent| {
+        let start = Instant::now();
+        info!("Validating block with slot: {}", block.message().slot());
+        let result = store.validate_block_with_custom_state_transition(block, |block_root, parent| {
             // > Make a copy of the state to avoid mutability issues
             let state = self
                 .state_cache
@@ -215,6 +365,7 @@ impl<P: Preset> BlockProcessor<P> {
                     {
                         PartialBlockAction::Accept => {}
                         PartialBlockAction::Ignore => {
+                            warn!("Block ignored at slot: {}", block.message().slot());
                             return Ok((state, Some(BlockAction::Ignore(false))))
                         }
                     }
@@ -231,9 +382,12 @@ impl<P: Preset> BlockProcessor<P> {
                 verifier,
                 NullSlotReport,
             )?;
+            info!("Block validation completed for slot: {}", block.message().slot());
 
             Ok((state, None))
-        })
+        });
+        self.update_metrics("validate_block", start.elapsed());
+        result
     }
 }
 
